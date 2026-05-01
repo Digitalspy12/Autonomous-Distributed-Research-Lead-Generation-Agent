@@ -1,21 +1,20 @@
 """
 Signal Scout 4.0 — Strategist Node
-Generates personalized cold outreach pitches using Gemini.
+Generates personalized cold outreach pitches using the unified LLM client.
 Takes enriched jobs + contacts and creates contextual pitches.
 
 Pipeline position: FOURTH node (Scout -> Analyst -> Researcher -> [Strategist] -> Critic)
-Runs on LOQ (needs internet for Gemini API).
+Fallback chain: Gemini 2.5 Flash -> Groq Llama 3.1 8B -> Ollama Qwen 3.5
+Runs on LOQ.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from typing import Optional
 
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
@@ -61,15 +60,7 @@ Output ONLY valid JSON (no markdown, no backticks):
 }}
 """
 
-
-def _get_gemini_client():
-    """Create Gemini client from env."""
-    load_dotenv()
-    from google import genai
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not set in .env")
-    return genai.Client(api_key=api_key)
+STRATEGIST_REQUIRED_KEYS = ["subject_line", "pitch_body"]
 
 
 def generate_pitch(
@@ -81,11 +72,10 @@ def generate_pitch(
     tech_stack: list,
     contact_name: str,
     contact_title: str,
-    model: str = "gemini-2.0-flash",
-    max_retries: int = 3,
+    db=None,
 ) -> Optional[dict]:
-    """Generate a single pitch using Gemini."""
-    client = _get_gemini_client()
+    """Generate a single pitch using the unified LLM client."""
+    from src.core.llm_client import call_llm
 
     prompt = STRATEGIST_PROMPT.format(
         company_name=company_name,
@@ -98,53 +88,39 @@ def generate_pitch(
         contact_title=contact_title or "Operations Leader",
     )
 
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-            )
+    try:
+        result = call_llm(
+            prompt=prompt,
+            node="strategist",
+            required_keys=STRATEGIST_REQUIRED_KEYS,
+            max_retries=2,
+            db=db,
+        )
+    except RuntimeError as e:
+        console.print(f"  [bold red]Strategist: {e}[/bold red]")
+        return None
 
-            text = response.text.strip()
-            # Strip markdown fences
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-            if text.startswith("json"):
-                text = text[4:].strip()
+    if result.parsed is None:
+        return None
 
-            result = json.loads(text)
+    parsed = result.parsed
 
-            required = ["subject_line", "pitch_body"]
-            if all(k in result for k in required):
-                # Count words
-                result["word_count"] = len(result["pitch_body"].split())
-                if "tone_profile" not in result:
-                    result["tone_profile"] = "consultative"
-                return result
+    # Count words
+    parsed["word_count"] = len(parsed.get("pitch_body", "").split())
+    if "tone_profile" not in parsed:
+        parsed["tone_profile"] = "consultative"
 
-        except json.JSONDecodeError:
-            console.print(f"  [yellow]Strategist: invalid JSON ({attempt+1}/{max_retries})[/yellow]")
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                wait = min(30, 10 * (attempt + 1))
-                console.print(f"  [yellow]Strategist: rate limited, waiting {wait}s...[/yellow]")
-                time.sleep(wait)
-            else:
-                console.print(f"  [red]Strategist: error: {e}[/red]")
-                break
-        time.sleep(2)
+    # Attach model metadata
+    parsed["_provider"] = result.provider
+    parsed["_model"] = result.model
+    parsed["_latency_ms"] = result.latency_ms
 
-    return None
+    return parsed
 
 
 def run_strategist(
     db: Optional[Database] = None,
     batch_size: int = 10,
-    model: str = "gemini-2.0-flash",
 ) -> dict:
     """
     Run the Strategist node: generate pitches for enriched jobs.
@@ -152,7 +128,6 @@ def run_strategist(
     Args:
         db: Database instance.
         batch_size: Max jobs to process per run.
-        model: Gemini model to use.
 
     Returns:
         Stats dict.
@@ -162,7 +137,7 @@ def run_strategist(
         db.init_schema()
 
     console.print("\n[bold cyan]Strategist Node -- Pitch Generation[/bold cyan]\n")
-    console.print(f"  Model: {model}")
+    console.print(f"  Fallback chain: Gemini 2.5 Flash -> Groq -> Ollama")
     console.print(f"  Batch size: {batch_size}\n")
 
     # Fetch enriched jobs
@@ -174,7 +149,7 @@ def run_strategist(
 
     console.print(f"  Found {len(jobs)} enriched jobs\n")
 
-    stats = {"total": len(jobs), "generated": 0, "errors": 0}
+    stats = {"total": len(jobs), "generated": 0, "errors": 0, "model_usage": {}}
 
     for i, job in enumerate(jobs, 1):
         job_id = job["id"]
@@ -215,7 +190,7 @@ def run_strategist(
             tech_stack=tech_stack,
             contact_name=contact.get("name", ""),
             contact_title=contact.get("title", ""),
-            model=model,
+            db=db,
         )
 
         if result is None:
@@ -223,6 +198,13 @@ def run_strategist(
             db.log_event(job_id, "strategist", "enriched", "error",
                         error_message="Pitch generation failed")
             continue
+
+        # Track model usage
+        model_used = result.pop("_model", "unknown")
+        provider_used = result.pop("_provider", "unknown")
+        latency = result.pop("_latency_ms", 0)
+        model_key = f"{provider_used}/{model_used}"
+        stats["model_usage"][model_key] = stats["model_usage"].get(model_key, 0) + 1
 
         # Insert pitch
         pitch = Pitch(
@@ -253,11 +235,13 @@ def run_strategist(
                 "pitch_id": pitch_id,
                 "word_count": result.get("word_count", 0),
                 "tone": result.get("tone_profile", ""),
+                "model": model_key,
+                "latency_ms": latency,
             },
         )
 
         stats["generated"] += 1
-        console.print(f"    [green]Pitch generated[/green] ({result.get('word_count', '?')} words, tone: {result.get('tone_profile', '?')})")
+        console.print(f"    [green]Pitch generated[/green] ({result.get('word_count', '?')} words, tone: {result.get('tone_profile', '?')}) via {model_key}")
         console.print(f"    Subject: {result['subject_line']}")
 
         time.sleep(1)
@@ -277,6 +261,12 @@ def _print_summary(stats: dict):
     table.add_row("Errors", str(stats["errors"]))
 
     console.print(table)
+
+    # Model usage breakdown
+    if stats.get("model_usage"):
+        console.print("\n[bold]Model usage:[/bold]")
+        for model, count in stats["model_usage"].items():
+            console.print(f"  {model}: {count}")
 
 
 if __name__ == "__main__":

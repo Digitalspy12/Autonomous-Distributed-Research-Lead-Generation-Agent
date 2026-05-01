@@ -1,21 +1,19 @@
 """
 Signal Scout 4.0 — Analyst Node
-Generates Pain Hypotheses using Gemini 2.0 Flash.
+Generates Pain Hypotheses using the unified LLM client.
 Processes pre-filtered jobs (pain_keyword_score >= 4).
 
 Pipeline position: SECOND node (Scout -> [Analyst] -> Researcher -> ...)
-Runs on LOQ (needs internet for Gemini API).
+Fallback chain: Gemini 2.5 Flash -> Groq Llama 3.1 70B -> Ollama Qwen 3.5
+Runs on LOQ (needs internet for cloud LLMs, or local Ollama).
 """
 
 from __future__ import annotations
 
-import json
-import os
 import sys
 import time
 from typing import Optional
 
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
@@ -58,15 +56,10 @@ Rules:
 - REJECT engineering/design/product roles that don't involve operational pain
 """
 
-
-def _get_gemini_client():
-    """Create Gemini client from env."""
-    load_dotenv()
-    from google import genai
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not set in .env")
-    return genai.Client(api_key=api_key)
+ANALYST_REQUIRED_KEYS = [
+    "pain_hypothesis", "primary_process", "automatibility_score",
+    "confidence", "verdict",
+]
 
 
 def analyze_job(
@@ -74,15 +67,15 @@ def analyze_job(
     company: str,
     location: str,
     description: str,
-    model: str = "gemini-2.0-flash",
-    max_retries: int = 3,
+    db=None,
 ) -> Optional[dict]:
     """
-    Analyze a single job posting with Gemini.
+    Analyze a single job posting with the unified LLM client.
 
+    Uses hierarchical fallback: Gemini -> Groq -> Ollama.
     Returns parsed JSON dict or None on failure.
     """
-    client = _get_gemini_client()
+    from src.core.llm_client import call_llm
 
     prompt = ANALYST_PROMPT.format(
         title=title,
@@ -91,68 +84,53 @@ def analyze_job(
         description=(description or "No description available")[:4000],
     )
 
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-            )
+    try:
+        result = call_llm(
+            prompt=prompt,
+            node="analyst",
+            required_keys=ANALYST_REQUIRED_KEYS,
+            max_retries=2,
+            db=db,
+        )
+    except RuntimeError as e:
+        console.print(f"  [bold red]Analyst: {e}[/bold red]")
+        return None
 
-            text = response.text.strip()
+    if result.parsed is None:
+        return None
 
-            # Strip markdown code fences if present
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-            if text.startswith("json"):
-                text = text[4:].strip()
+    parsed = result.parsed
 
-            result = json.loads(text)
+    # Normalize and validate fields
+    try:
+        parsed["automatibility_score"] = max(0, min(10, int(parsed["automatibility_score"])))
+        parsed["confidence"] = max(0, min(10, int(parsed["confidence"])))
+    except (ValueError, TypeError):
+        parsed["automatibility_score"] = 0
+        parsed["confidence"] = 0
 
-            # Validate required fields
-            required = ["pain_hypothesis", "primary_process", "automatibility_score", "confidence", "verdict"]
-            if all(k in result for k in required):
-                # Ensure score bounds
-                result["automatibility_score"] = max(0, min(10, int(result["automatibility_score"])))
-                result["confidence"] = max(0, min(10, int(result["confidence"])))
-                result["verdict"] = result["verdict"].upper()
-                if result["verdict"] not in ("PASS", "REJECT"):
-                    result["verdict"] = "REJECT"
-                return result
+    parsed["verdict"] = str(parsed.get("verdict", "REJECT")).upper()
+    if parsed["verdict"] not in ("PASS", "REJECT"):
+        parsed["verdict"] = "REJECT"
 
-            console.print(f"  [yellow]Analyst: missing fields, retrying ({attempt+1}/{max_retries})[/yellow]")
+    # Attach model metadata for logging
+    parsed["_provider"] = result.provider
+    parsed["_model"] = result.model
+    parsed["_latency_ms"] = result.latency_ms
 
-        except json.JSONDecodeError:
-            console.print(f"  [yellow]Analyst: invalid JSON, retrying ({attempt+1}/{max_retries})[/yellow]")
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                wait = min(30, 10 * (attempt + 1))
-                console.print(f"  [yellow]Analyst: rate limited, waiting {wait}s...[/yellow]")
-                time.sleep(wait)
-            else:
-                console.print(f"  [red]Analyst: error: {e}[/red]")
-                break
-
-        time.sleep(2)
-
-    return None
+    return parsed
 
 
 def run_analyst(
     db=None,
     batch_size: int = 20,
-    model: str = "gemini-2.0-flash",
 ) -> dict:
     """
-    Run the Analyst node: process pre-filtered jobs with Gemini.
+    Run the Analyst node: process pre-filtered jobs with LLM.
 
     Args:
         db: Database instance.
         batch_size: Max jobs to process per run.
-        model: Gemini model to use.
 
     Returns:
         Stats dict with pass/reject/error counts.
@@ -164,7 +142,7 @@ def run_analyst(
         db.init_schema()
 
     console.print("\n[bold cyan]Analyst Node -- Pain Hypothesis Generation[/bold cyan]\n")
-    console.print(f"  Model: {model}")
+    console.print(f"  Fallback chain: Gemini 2.5 Flash -> Groq -> Ollama")
     console.print(f"  Batch size: {batch_size}\n")
 
     # Fetch pre-filtered jobs
@@ -176,7 +154,7 @@ def run_analyst(
 
     console.print(f"  Found {len(jobs)} pre-filtered jobs\n")
 
-    stats = {"total": len(jobs), "passed": 0, "rejected": 0, "errors": 0}
+    stats = {"total": len(jobs), "passed": 0, "rejected": 0, "errors": 0, "model_usage": {}}
 
     for i, job in enumerate(jobs, 1):
         job_id = job["id"]
@@ -199,14 +177,21 @@ def run_analyst(
             company=company_name,
             location=job.get("location", ""),
             description=job.get("description", ""),
-            model=model,
+            db=db,
         )
 
         if result is None:
             stats["errors"] += 1
             db.update_job_status(job_id, "error")
-            db.log_event(job_id, "analyst", "pre_filtered", "error", error_message="Gemini analysis failed")
+            db.log_event(job_id, "analyst", "pre_filtered", "error", error_message="LLM analysis failed")
             continue
+
+        # Track model usage
+        model_used = result.pop("_model", "unknown")
+        provider_used = result.pop("_provider", "unknown")
+        latency = result.pop("_latency_ms", 0)
+        model_key = f"{provider_used}/{model_used}"
+        stats["model_usage"][model_key] = stats["model_usage"].get(model_key, 0) + 1
 
         # Update job with analyst output
         db.update_job_analyst(
@@ -232,16 +217,18 @@ def run_analyst(
                 "confidence": result["confidence"],
                 "verdict": result["verdict"],
                 "pain_hypothesis": result["pain_hypothesis"][:100],
+                "model": model_key,
+                "latency_ms": latency,
             },
         )
 
         if result["verdict"] == "PASS":
             stats["passed"] += 1
-            console.print(f"    [green]PASS[/green] (score: {result['automatibility_score']}/10, confidence: {result['confidence']}/10)")
+            console.print(f"    [green]PASS[/green] (score: {result['automatibility_score']}/10, confidence: {result['confidence']}/10) via {model_key}")
             console.print(f"    Pain: {result['pain_hypothesis'][:80]}...")
         else:
             stats["rejected"] += 1
-            console.print(f"    [dim]REJECT[/dim] (score: {result['automatibility_score']}/10)")
+            console.print(f"    [dim]REJECT[/dim] (score: {result['automatibility_score']}/10) via {model_key}")
 
         # Rate limit: 1 req/sec
         time.sleep(1)
@@ -267,6 +254,12 @@ def _print_summary(stats: dict):
         table.add_row("Pass rate", f"{pass_rate}%")
 
     console.print(table)
+
+    # Model usage breakdown
+    if stats.get("model_usage"):
+        console.print("\n[bold]Model usage:[/bold]")
+        for model, count in stats["model_usage"].items():
+            console.print(f"  {model}: {count}")
 
 
 if __name__ == "__main__":

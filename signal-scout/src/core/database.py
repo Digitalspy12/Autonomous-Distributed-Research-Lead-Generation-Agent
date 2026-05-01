@@ -194,6 +194,23 @@ class Database:
                 synced INTEGER DEFAULT 0
             );
 
+            -- LLM call log (every LLM invocation for debugging/cost tracking)
+            CREATE TABLE IF NOT EXISTS llm_call_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                node TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_chars INTEGER,
+                response_chars INTEGER,
+                latency_ms INTEGER,
+                attempt INTEGER DEFAULT 1,
+                fallback_chain TEXT,        -- JSON array
+                status TEXT NOT NULL,       -- 'success', 'error', 'timeout'
+                error_message TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
             CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id);
@@ -208,6 +225,10 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_contacts_synced ON contacts(synced);
             CREATE INDEX IF NOT EXISTS idx_pitches_synced ON pitches(synced);
             CREATE INDEX IF NOT EXISTS idx_events_synced ON pipeline_events(synced);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_node ON llm_call_log(node);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_provider ON llm_call_log(provider);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_timestamp ON llm_call_log(timestamp);
+
         """)
 
         self.conn.commit()

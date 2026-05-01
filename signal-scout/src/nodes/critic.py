@@ -1,23 +1,21 @@
 """
 Signal Scout 4.0 — Critic Node
-Scores pitches on 7 dimensions using Gemini 2.0 Flash (primary)
-with DeepSeek R1 7B via Ollama (fallback).
+Scores pitches on 7 dimensions using the unified LLM client.
 
 Pipeline position: FIFTH node (Scout -> Analyst -> Researcher -> Strategist -> [Critic])
-Model Strategy: Gemini 2.0 Flash primary, DeepSeek R1 7B fallback.
+Fallback chain (REVERSED): Ollama Qwen 3.5 -> Groq -> Gemini 2.5 Flash
+  - Critic uses local-first because reasoning models run free and unlimited.
+
 Runs on LOQ.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from typing import Optional
 
-import requests
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
@@ -67,136 +65,10 @@ Output ONLY valid JSON (no markdown, no backticks):
 }}
 """
 
-
-def _get_gemini_client():
-    """Create Gemini client from env."""
-    load_dotenv()
-    from google import genai
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not set in .env")
-    return genai.Client(api_key=api_key)
-
-
-def _score_with_gemini(prompt: str, model: str = "gemini-2.0-flash") -> Optional[dict]:
-    """Score pitch using Gemini."""
-    client = _get_gemini_client()
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
-        text = response.text.strip()
-        # Strip markdown fences
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        if text.startswith("json"):
-            text = text[4:].strip()
-        return json.loads(text)
-    except Exception as e:
-        error_str = str(e)
-        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-            console.print("  [yellow]Critic: Gemini rate limited, falling back to Ollama...[/yellow]")
-        else:
-            console.print(f"  [yellow]Critic: Gemini failed ({str(e)[:60]}), falling back to Ollama...[/yellow]")
-        return None
-
-
-def _score_with_ollama(prompt: str) -> Optional[dict]:
-    """Score pitch using DeepSeek R1 7B via Ollama (fallback)."""
-    load_dotenv()
-    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-
-    try:
-        r = requests.post(
-            f"{ollama_url}/api/generate",
-            json={
-                "model": "deepseek-r1:7b",
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.3, "num_predict": 500},
-            },
-            timeout=120,  # Ollama can be slow
-        )
-
-        if r.status_code != 200:
-            console.print(f"  [red]Critic: Ollama returned {r.status_code}[/red]")
-            return None
-
-        data = r.json()
-        text = data.get("response", "").strip()
-
-        # DeepSeek R1 may include <think> tags — strip them
-        if "<think>" in text:
-            # Remove everything between <think> and </think>
-            import re
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-        # Strip markdown fences
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        if text.startswith("json"):
-            text = text[4:].strip()
-
-        return json.loads(text)
-
-    except requests.exceptions.ConnectionError:
-        console.print("  [red]Critic: Ollama not running (install with: ollama serve)[/red]")
-    except json.JSONDecodeError:
-        console.print("  [yellow]Critic: Ollama returned invalid JSON[/yellow]")
-    except Exception as e:
-        console.print(f"  [red]Critic: Ollama error: {e}[/red]")
-
-    return None
-
-
-def score_pitch(
-    subject_line: str,
-    pitch_body: str,
-    company_name: str,
-    pain_hypothesis: str,
-    contact_name: str,
-    contact_title: str,
-) -> Optional[dict]:
-    """
-    Score a pitch. Strategy: Gemini primary, Ollama DeepSeek R1 fallback.
-
-    Returns dict with scores + verdict or None on total failure.
-    """
-    prompt = CRITIC_PROMPT.format(
-        subject_line=subject_line,
-        pitch_body=pitch_body,
-        company_name=company_name,
-        pain_hypothesis=pain_hypothesis or "Unknown",
-        contact_name=contact_name or "Decision Maker",
-        contact_title=contact_title or "Operations Leader",
-    )
-
-    # Strategy 1: Gemini 2.0 Flash (primary)
-    result = _score_with_gemini(prompt)
-    if result and _validate_scores(result):
-        result["_model"] = "gemini-2.0-flash"
-        return _normalize_result(result)
-
-    # Strategy 2: Ollama DeepSeek R1 (fallback)
-    result = _score_with_ollama(prompt)
-    if result and _validate_scores(result):
-        result["_model"] = "deepseek-r1:7b"
-        return _normalize_result(result)
-
-    return None
-
-
-def _validate_scores(result: dict) -> bool:
-    """Check that all 7 score fields exist."""
-    required_scores = ["specificity", "consultative", "tone", "brevity", "value", "credibility", "humanity"]
-    return all(k in result for k in required_scores)
+CRITIC_REQUIRED_KEYS = [
+    "specificity", "consultative", "tone", "brevity",
+    "value", "credibility", "humanity",
+]
 
 
 def _normalize_result(result: dict) -> dict:
@@ -217,6 +89,60 @@ def _normalize_result(result: dict) -> dict:
         result["feedback"] = "No feedback provided"
 
     return result
+
+
+def score_pitch(
+    subject_line: str,
+    pitch_body: str,
+    company_name: str,
+    pain_hypothesis: str,
+    contact_name: str,
+    contact_title: str,
+    db=None,
+) -> Optional[dict]:
+    """
+    Score a pitch using the unified LLM client.
+
+    Critic uses REVERSED fallback: Ollama first (best local reasoning),
+    then Groq, then Gemini. This is handled by the LLMClient automatically
+    based on node="critic".
+
+    Returns dict with scores + verdict or None on total failure.
+    """
+    from src.core.llm_client import call_llm
+
+    prompt = CRITIC_PROMPT.format(
+        subject_line=subject_line,
+        pitch_body=pitch_body,
+        company_name=company_name,
+        pain_hypothesis=pain_hypothesis or "Unknown",
+        contact_name=contact_name or "Decision Maker",
+        contact_title=contact_title or "Operations Leader",
+    )
+
+    try:
+        result = call_llm(
+            prompt=prompt,
+            node="critic",
+            required_keys=CRITIC_REQUIRED_KEYS,
+            max_retries=2,
+            db=db,
+        )
+    except RuntimeError as e:
+        console.print(f"  [bold red]Critic: {e}[/bold red]")
+        return None
+
+    if result.parsed is None:
+        return None
+
+    parsed = _normalize_result(result.parsed)
+
+    # Attach model metadata
+    parsed["_provider"] = result.provider
+    parsed["_model"] = result.model
+    parsed["_latency_ms"] = result.latency_ms
+
+    return parsed
 
 
 # ============================================
@@ -242,7 +168,7 @@ def run_critic(
         db.init_schema()
 
     console.print("\n[bold cyan]Critic Node -- Pitch Scoring[/bold cyan]\n")
-    console.print("  Strategy: Gemini 2.0 Flash -> DeepSeek R1 7B (Ollama)\n")
+    console.print("  Fallback chain (reversed): Ollama -> Groq -> Gemini\n")
 
     # Fetch pitch_written jobs
     jobs = db.get_jobs_by_status("pitch_written", limit=batch_size)
@@ -296,17 +222,21 @@ def run_critic(
                 pain_hypothesis=job.get("pain_hypothesis", ""),
                 contact_name=contact_name,
                 contact_title=contact_title,
+                db=db,
             )
 
             if result is None:
                 stats["errors"] += 1
                 db.log_event(job_id, "critic", "pitch_written", "error",
-                            error_message="Both Gemini and Ollama failed")
+                            error_message="All LLM providers failed")
                 continue
 
             # Track model usage
             model_used = result.pop("_model", "unknown")
-            stats["model_usage"][model_used] = stats["model_usage"].get(model_used, 0) + 1
+            provider_used = result.pop("_provider", "unknown")
+            latency = result.pop("_latency_ms", 0)
+            model_key = f"{provider_used}/{model_used}"
+            stats["model_usage"][model_key] = stats["model_usage"].get(model_key, 0) + 1
 
             # Update pitch with scores
             scores = {k: result[k] for k in ["specificity", "consultative", "tone", "brevity", "value", "credibility", "humanity"]}
@@ -344,17 +274,18 @@ def run_critic(
                     "pitch_id": pitch_id,
                     "average": result["average"],
                     "verdict": result["verdict"],
-                    "model": model_used,
+                    "model": model_key,
+                    "latency_ms": latency,
                     "scores": scores,
                 },
             )
 
             if result["verdict"] == "PASS":
                 stats["passed"] += 1
-                console.print(f"    [green]PASS[/green] avg={result['average']}/10 (via {model_used})")
+                console.print(f"    [green]PASS[/green] avg={result['average']}/10 via {model_key}")
             else:
                 stats["failed"] += 1
-                console.print(f"    [red]FAIL[/red] avg={result['average']}/10 (via {model_used})")
+                console.print(f"    [red]FAIL[/red] avg={result['average']}/10 via {model_key}")
             console.print(f"    Feedback: {result.get('feedback', '')[:80]}")
 
             time.sleep(1)
@@ -374,13 +305,13 @@ def _print_summary(stats: dict):
     table.add_row("FAIL (avg < 6.5)", str(stats["failed"]))
     table.add_row("Errors", str(stats["errors"]))
 
-    if stats["model_usage"]:
-        console.print()
-        console.print("[bold]Model usage:[/bold]")
+    console.print(table)
+
+    # Model usage breakdown
+    if stats.get("model_usage"):
+        console.print("\n[bold]Model usage:[/bold]")
         for model, count in stats["model_usage"].items():
             console.print(f"  {model}: {count}")
-
-    console.print(table)
 
 
 if __name__ == "__main__":

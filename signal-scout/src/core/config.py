@@ -17,8 +17,23 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- Google AI Studio (Gemini 2.0 Flash) ---
+    # --- Google AI Studio (Gemini 2.5 Flash) ---
     gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_enabled: bool = True
+
+    # --- Groq Cloud (Free Tier) ---
+    groq_api_key: str = ""
+    groq_model_analyst: str = "llama-3.3-70b-versatile"
+    groq_model_strategist: str = "llama-3.1-8b-instant"
+    groq_enabled: bool = True
+
+    # --- Ollama (Local LLM) ---
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model_analyst: str = "qwen3.5:latest"
+    ollama_model_critic: str = "qwen3.5:latest"
+    ollama_enabled: bool = True
+    ollama_timeout_seconds: int = 120
 
     # --- Enrichment APIs ---
     hunter_api_key: str = ""
@@ -29,15 +44,12 @@ class Settings(BaseSettings):
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
 
-    # --- Ollama (Local LLM — fallback for Critic) ---
-    ollama_base_url: str = "http://localhost:11434"
-
     # --- Local Database ---
     sqlite_path: str = "./data/signal_scout.db"
 
     # --- Rate Limits ---
     scout_interval_hours: int = 4
-    gemini_daily_quota: int = 1500
+    gemini_daily_quota: int = 20
     hunter_monthly_quota: int = 25
     apollo_monthly_quota: int = 50
     searxng_daily_quota: int = 20
@@ -46,10 +58,19 @@ class Settings(BaseSettings):
     request_timeout: int = 15
     rate_limit_delay: float = 1.0  # seconds between requests per domain
 
+    # --- LLM Fallback Behavior ---
+    llm_fallback_order: str = "gemini,groq,ollama"  # Comma-separated priority
+    skip_on_no_llm: bool = True  # True = halt pipeline, False = queue for manual
+
     @property
     def sqlite_abs_path(self) -> Path:
         """Resolve SQLite path relative to project root."""
         return Path(self.sqlite_path).resolve()
+
+    @property
+    def fallback_order_list(self) -> list[str]:
+        """Parse fallback order into list."""
+        return [p.strip().lower() for p in self.llm_fallback_order.split(",") if p.strip()]
 
 
 # --- Singleton ---
