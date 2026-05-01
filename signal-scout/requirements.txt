@@ -1,0 +1,11 @@
+requests==2.32.*
+beautifulsoup4==4.13.*
+feedparser==6.0.*
+google-genai==1.*
+supabase==2.*
+pydantic==2.*
+pydantic-settings==2.*
+langgraph==0.4.*
+schedule==1.2.*
+rich==14.*
+python-dotenv==1.*

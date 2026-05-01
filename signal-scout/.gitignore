@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Environment variables (SECRETS)
+.env
+
+# SQLite database
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Next.js (dashboard)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+
+# Distribution
+dist/
+build/
+*.egg-info/
